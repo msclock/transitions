@@ -44,6 +44,20 @@ def _build_state_list(state_tree, separator, prefix=None):
     return res if len(res) > 1 else res[0]
 
 
+def _merge_state_trees(target, source):
+    for k, v in target.items():  # in Python 2, use .iteritems()!
+        if k in source:
+            source[k] = _merge_state_trees(v, source[k])
+    target.update(source)
+    return target
+
+
+def _remove_duplicates(partial_list):
+    seen = set()
+    seen_add = seen.add
+    return [x for x in partial_list if not (x in seen or seen_add(x))]
+
+
 def resolve_order(state_tree):
     """ Converts a (model) state tree into a list of state paths. States are ordered in the way in which states
     should be visited to process the event correctly (Breadth-first). This makes sure that ALL children are evaluated
@@ -239,41 +253,51 @@ class NestedTransition(Transition):
     """ A transition which handles entering and leaving nested states. """
 
     def _resolve_transition(self, event_data):
-        dst_name_path = self.dest.split(event_data.machine.state_cls.separator)
-        _ = event_data.machine.get_state(dst_name_path)
+        dst_name_paths = [dest.split(event_data.machine.state_cls.separator) for dest in listify(self.dest)]
+        for path in dst_name_paths:
+            _ = event_data.machine.get_state(path)
         state_tree = event_data.machine.build_state_tree(
             listify(getattr(event_data.model, event_data.machine.model_attribute)),
             event_data.machine.state_cls.separator)
 
         scope = event_data.machine.get_global_name(join=False)
-        tmp_tree = state_tree.get(dst_name_path[0], None)
-        root = []
-        while tmp_tree is not None:
-            root.append(dst_name_path.pop(0))
-            tmp_tree = tmp_tree.get(dst_name_path[0], None) if len(dst_name_path) > 0 else None
+        exit_partials = []
+        enter_partials = []
+        new_states = []
+        scoped_tree = OrderedDict()
+        for idx, path in enumerate(dst_name_paths):
+            tmp_tree = state_tree.get(path[0], None)
+            root = []
+            while tmp_tree is not None:
+                root.append(path.pop(0))
+                tmp_tree = tmp_tree.get(path[0], None) if len(path) > 0 else None
 
-        # when destination is empty this means we are already in the state we want to enter
-        # we deal with a reflexive transition here as internal transitions have been already dealt with
-        # the 'root' of src and dest will be set to the parent and dst (and src) substate will be set as destination
-        if not dst_name_path:
-            dst_name_path = [root.pop()]
+            # when destination is empty this means we are already in the state we want to enter
+            # we deal with a reflexive transition here as internal transitions have been already dealt with
+            # the 'root' of src and dest will be set to the parent and dst (and src) substate will be set as destination
+            if not path:
+                dst_name_paths[idx] = [root.pop()]
 
-        scoped_tree = reduce(dict.get, scope + root, state_tree)
+            scoped_tree = reduce(dict.get, scope + root, state_tree)
 
-        exit_partials = [partial(event_data.machine.get_state(root + state_name).scoped_exit,
-                                 event_data, scope + root + state_name[:-1])
-                         for state_name in resolve_order(scoped_tree)]
-        if dst_name_path:
-            new_states, enter_partials = self._enter_nested(root, dst_name_path, scope + root, event_data)
-        else:
-            new_states, enter_partials = {}, []
+            exit_partials.extend([partial(event_data.machine.get_state(root + state_name).scoped_exit,
+                                          event_data, scope + root + state_name[:-1])
+                                  for state_name in resolve_order(scoped_tree)])
+
+            states, partials = self._enter_nested(root, dst_name_paths[idx], scope + root, event_data)
+            new_states.append(states)
+
+            enter_partials.extend(partials)
+
+        new_state = new_states.pop(0)
+        for n_state in new_states:
+            _merge_state_trees(new_state, n_state)
 
         scoped_tree.clear()
-        for new_key, value in new_states.items():
+        for new_key, value in new_state.items():
             scoped_tree[new_key] = value
-            break
 
-        return state_tree, exit_partials, enter_partials
+        return state_tree, _remove_duplicates(exit_partials), _remove_duplicates(enter_partials)
 
     def _change_state(self, event_data):
         state_tree, exit_partials, enter_partials = self._resolve_transition(event_data)
